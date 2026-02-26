@@ -1,5 +1,6 @@
 import copy
 import math
+import numbers
 import os
 import shutil
 from collections import defaultdict
@@ -127,6 +128,54 @@ class RayPPOTrainer:
     def has_critic(self) -> bool:
         """Check if critic model is configured."""
         return bool(self.cfg.trainer.critic.model.path)
+
+    def _normalize_token_id_sample(self, sample: Any, field_name: str, sample_idx: int) -> List[int]:
+        """Normalize mixed token containers to List[int]."""
+        if hasattr(sample, "input_ids"):
+            sample = sample.input_ids
+        elif isinstance(sample, dict) and "input_ids" in sample:
+            sample = sample["input_ids"]
+
+        if hasattr(sample, "tolist") and not isinstance(sample, list):
+            sample = sample.tolist()
+        elif isinstance(sample, tuple):
+            sample = list(sample)
+
+        if isinstance(sample, str):
+            return self.tokenizer.encode(sample, add_special_tokens=False)
+
+        if not isinstance(sample, list):
+            raise TypeError(
+                f"{field_name}[{sample_idx}] must be a token-id list or string, got {type(sample)!r}"
+            )
+
+        if len(sample) == 1 and isinstance(sample[0], list):
+            sample = sample[0]
+
+        token_ids: List[int] = []
+        all_numeric = True
+        for tok in sample:
+            if isinstance(tok, numbers.Integral):
+                token_ids.append(int(tok))
+                continue
+            if isinstance(tok, str):
+                tok_str = tok.strip()
+                if tok_str and (tok_str.isdigit() or (tok_str[0] in "+-" and tok_str[1:].isdigit())):
+                    token_ids.append(int(tok_str))
+                    continue
+            all_numeric = False
+            break
+
+        if all_numeric:
+            return token_ids
+
+        # Fallback for malformed string-based sequences.
+        logger.warning(
+            "%s[%d] is non-numeric; re-tokenizing from string fallback.",
+            field_name,
+            sample_idx,
+        )
+        return self.tokenizer.encode("".join(str(tok) for tok in sample), add_special_tokens=False)
 
     def _build_train_dataloader_and_compute_training_steps(self):
         """
@@ -591,8 +640,16 @@ class RayPPOTrainer:
 
     def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training"""
-        prompt_ids: List[List[int]] = generator_output["prompt_token_ids"]
-        response_ids: List[List[int]] = generator_output["response_ids"]
+        prompt_ids_raw = generator_output["prompt_token_ids"]
+        response_ids_raw = generator_output["response_ids"]
+        prompt_ids: List[List[int]] = [
+            self._normalize_token_id_sample(sample, "prompt_token_ids", i)
+            for i, sample in enumerate(prompt_ids_raw)
+        ]
+        response_ids: List[List[int]] = [
+            self._normalize_token_id_sample(sample, "response_ids", i)
+            for i, sample in enumerate(response_ids_raw)
+        ]
         rewards: List[List[float]] = generator_output["rewards"]
         loss_masks: List[List[int]] = generator_output["loss_masks"]
 
