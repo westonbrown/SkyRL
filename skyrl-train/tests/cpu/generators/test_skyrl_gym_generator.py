@@ -1627,3 +1627,108 @@ async def test_step_wise_trajectories_basic_output_validation(mock_make, mock_to
     # Validate stop_reasons
     for i, stop_reason in enumerate(generator_output["stop_reasons"]):
         assert isinstance(stop_reason, str), f"stop_reasons[{i}] should be a string"
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_step_wise_trajectories_supports_custom_chat_template(
+    mock_make, mock_tokenizer, mock_llm, mock_env_cfg
+):
+    """Step-wise training should work with custom chat templates (retokenize path)."""
+    from skyrl_train.generators.base import TrajectoryID
+
+    mock_tokenizer.eos_token_id = 4
+
+    def apply_chat_template_side_effect(messages, **kwargs):
+        if kwargs.get("tokenize", True):
+            # Observation formatting path (messages include obs marker)
+            if isinstance(messages, list) and any(
+                isinstance(m, dict) and m.get("content") == "obs1" for m in messages
+            ):
+                return [901]
+            # Prompt/chat formatting path
+            return [201, 202]
+        return "".join([m.get("content", "") for m in messages])
+
+    mock_tokenizer.apply_chat_template.side_effect = apply_chat_template_side_effect
+
+    async def llm_generate_side_effect(input_batch):
+        num = (
+            len(input_batch["prompt_token_ids"])
+            if "prompt_token_ids" in input_batch
+            else len(input_batch["prompts"])
+        )
+        return {
+            "responses": ["step"] * num,
+            "stop_reasons": ["stop"] * num,
+            "response_logprobs": None,
+            "response_ids": [[10, 11, 12, mock_tokenizer.eos_token_id] for _ in range(num)],
+        }
+
+    mock_llm.generate = AsyncMock(side_effect=llm_generate_side_effect)
+
+    class MultiStepEnv(BaseTextEnv):
+        def __init__(self):
+            super().__init__()
+            self.turns = 0
+
+        def init(self, prompt):
+            return prompt, {}
+
+        def step(self, action):
+            self.turns += 1
+            if self.turns == 1:
+                return BaseTextEnvStepOutput(
+                    observations=[{"role": "user", "content": "obs1"}], reward=0.5, done=False, metadata={}
+                )
+            return BaseTextEnvStepOutput(observations=[], reward=1.0, done=True, metadata={})
+
+    mock_make.return_value = MultiStepEnv()
+
+    cfg = GeneratorConfig()
+    cfg.sampling_params.max_generate_length = 50
+    cfg.sampling_params.logprobs = None
+    cfg.apply_overlong_filtering = False
+    cfg.max_input_length = 512
+    cfg.batched = False
+    cfg.max_turns = 10
+    cfg.zero_reward_on_non_stop = False
+    cfg.use_conversation_multi_turn = True
+    cfg.step_wise_trajectories = True
+    cfg.chat_template = ChatTemplateConfig(source="name", name_or_path="qwen3_without_thinking")
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+        model_name="Qwen/Qwen3-0.6B",
+    )
+    generator.base_conversation_token_ids = []
+
+    generator_output: GeneratorOutput = await generator.generate(
+        {
+            "prompts": [[{"role": "user", "content": "Q?"}]],
+            "env_extras": [{"test": "value"}],
+            "env_classes": [mock_env_cfg.env_class],
+            "trajectory_ids": [TrajectoryID(instance_id="uid-custom", repetition_id=0)],
+        }
+    )
+
+    assert len(generator_output["response_ids"]) == 2
+    assert len(generator_output["rewards"]) == 2
+    assert generator_output["is_last_step"] == [False, True]
+
+    # Step 1 has 4 model tokens + 1 observation token. Reward should be placed on
+    # the last model token index (3), not on observation token index (4).
+    step1_rewards = generator_output["rewards"][0]
+    assert isinstance(step1_rewards, list)
+    assert len(step1_rewards) == 5
+    assert step1_rewards[3] == 0.5
+    assert step1_rewards[4] == 0.0
+
+    # Step 2 has only model tokens.
+    step2_rewards = generator_output["rewards"][1]
+    assert isinstance(step2_rewards, list)
+    assert len(step2_rewards) == 4
+    assert step2_rewards[3] == 1.0

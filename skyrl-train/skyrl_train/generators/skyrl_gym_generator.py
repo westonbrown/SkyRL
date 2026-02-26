@@ -167,11 +167,6 @@ class SkyRLGymGenerator(GeneratorInterface):
             if self.batched:
                 raise ValueError("`step_wise_trajectories` doesn't support `batched=True`")
 
-            if self.custom_chat_template is not None:
-                raise ValueError(
-                    f"`step_wise_trajectories` doesn't support custom chat template, got {generator_cfg.chat_template}"
-                )
-
             if not self.use_conversation_multi_turn:
                 raise ValueError("`step_wise_trajectories` doesn't support `use_conversation_multi_turn=False`")
 
@@ -409,7 +404,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         # We remove the final observation messages /token IDs here
         # Note that during the agent loop, we still add the final observation messages/ tokens because we terminate the agent loop if the input length
         # exceeds the maximum
-        if retokenize_chat_history:
+        if retokenize_chat_history and not self.generator_cfg.step_wise_trajectories:
             response_encodings = self.tokenizer.apply_chat_template(
                 agent_loop_state.chat_history[
                     initial_chat_history_length : len(agent_loop_state.chat_history) - len(new_obs)
@@ -829,8 +824,10 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         Returns:
             AgentLoopState: Updated agent loop state with retokenized chat history and input IDs.
-                Note: loss_mask, response_end_idx, and rollout_logprobs are set to None as they
+                Note: loss_mask and rollout_logprobs are set to None as they
                 are computed at the end with the custom chat template.
+                For step-wise trajectories, response_end_idx is still tracked
+                per turn so per-token rewards can be assigned in StepWiseOutput.
         """
         assert self.use_conversation_multi_turn and self.custom_chat_template
 
@@ -840,8 +837,13 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         # `loss_mask` is computed at the end with `custom_chat_template`
         agent_loop_state.loss_mask = None
-        # untracked state
-        agent_loop_state.response_end_idx = None
+        # For step-wise training we still need an in-turn response boundary
+        # to place the per-step reward on the assistant response tokens.
+        if self.generator_cfg.step_wise_trajectories:
+            agent_loop_state.response_end_idx = len(turn_output.output_ids) - 1
+        else:
+            # untracked state
+            agent_loop_state.response_end_idx = None
         # `logprobs` are not computed because retokenizing breaks token-in-token-out
         agent_loop_state.rollout_logprobs = None
         return agent_loop_state
