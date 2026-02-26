@@ -614,6 +614,22 @@ class RayPPOTrainer:
             logprobs,
         )
 
+        is_last_step = generator_output.get("is_last_step", None)
+        if is_last_step is not None and hasattr(is_last_step, "tolist"):
+            is_last_step = is_last_step.tolist()
+        if is_last_step is not None:
+            is_last_step = [bool(x) for x in is_last_step]
+
+        if self.cfg.generator.step_wise_trajectories:
+            if is_last_step is None or len(is_last_step) != len(response_ids):
+                logger.warning(
+                    "Step-wise trajectories enabled, but generator output is missing/malformed "
+                    "`is_last_step` (len=%s, expected=%s). Falling back to all True.",
+                    len(is_last_step) if is_last_step is not None else None,
+                    len(response_ids),
+                )
+                is_last_step = [True] * len(response_ids)
+
         # sanity check for off_policy_correction
         off_policy_correction = self.cfg.trainer.algorithm.off_policy_correction
         tis_ratio_type = off_policy_correction.tis_ratio_type
@@ -632,27 +648,29 @@ class RayPPOTrainer:
                 "rewards": rewards_tensor,
                 "loss_mask": loss_masks_tensor,
                 "rollout_logprobs": rollout_logprobs_tensor,
-                "is_last_step": (
-                    torch.tensor(generator_output["is_last_step"], dtype=torch.bool)
-                    if generator_output.get("is_last_step", None) is not None
-                    else None
-                ),
+                "is_last_step": torch.tensor(is_last_step, dtype=torch.bool) if is_last_step is not None else None,
             },
         )
         training_input.metadata = {"uids": uids}
         # padded response length
         training_input.metadata["response_length"] = response_masks_tensor.shape[1]
         if self.cfg.generator.step_wise_trajectories:
-            assert (
-                "trajectory_ids" in generator_output
-            ), "Expected `trajectory_ids` in generator output for step wise training"
-            training_input.metadata["trajectory_ids"] = [
-                trajectory_id.to_string() for trajectory_id in generator_output["trajectory_ids"]
-            ]
+            trajectory_ids = generator_output.get("trajectory_ids", None)
+            if trajectory_ids is None or len(trajectory_ids) != len(response_ids):
+                logger.warning(
+                    "Step-wise trajectories enabled, but generator output is missing/malformed "
+                    "`trajectory_ids` (len=%s, expected=%s). Falling back to uid-based IDs.",
+                    len(trajectory_ids) if trajectory_ids is not None else None,
+                    len(response_ids),
+                )
+                training_input.metadata["trajectory_ids"] = list(uids)
+            else:
+                training_input.metadata["trajectory_ids"] = [
+                    trajectory_id.to_string() if hasattr(trajectory_id, "to_string") else str(trajectory_id)
+                    for trajectory_id in trajectory_ids
+                ]
             training_input.metadata["avg_response_length"] = sum(
-                len(sample_response_ids)
-                for sample_response_ids, is_last_step in zip(response_ids, generator_output["is_last_step"])
-                if is_last_step
+                len(sample_response_ids) for sample_response_ids, is_last in zip(response_ids, is_last_step) if is_last
             ) / len(response_ids)
         else:
             training_input.metadata["avg_response_length"] = sum(
@@ -700,17 +718,31 @@ class RayPPOTrainer:
         generator_output_for_metrics = generator_output
         uids_for_metrics = uids
         if self.cfg.generator.step_wise_trajectories:
+            is_last_step = generator_output.get("is_last_step", None)
+            if is_last_step is not None and hasattr(is_last_step, "tolist"):
+                is_last_step = is_last_step.tolist()
+            if is_last_step is not None:
+                is_last_step = [bool(x) for x in is_last_step]
+            if is_last_step is None or len(is_last_step) != len(uids):
+                logger.warning(
+                    "Step-wise trajectories enabled, but generator output is missing/malformed "
+                    "`is_last_step` during postprocessing (len=%s, expected=%s). "
+                    "Falling back to all True.",
+                    len(is_last_step) if is_last_step is not None else None,
+                    len(uids),
+                )
+                is_last_step = [True] * len(uids)
+            generator_output["is_last_step"] = is_last_step
+
             generator_output_for_metrics = defaultdict(list)
             for key in generator_output:
                 if isinstance(generator_output[key], list):
                     generator_output_for_metrics[key] = [
                         generator_output[key][i]
                         for i in range(len(generator_output[key]))
-                        if generator_output["is_last_step"][i]
+                        if is_last_step[i]
                     ]
-            uids_for_metrics = [
-                uid for uid, is_last_step in zip(uids, generator_output["is_last_step"]) if is_last_step
-            ]
+            uids_for_metrics = [uid for uid, is_last in zip(uids, is_last_step) if is_last]
 
         # only use `generator_output_for_metrics` for metrics calculation
         # For step-wise training, we only calculate metrics for the last step of each trajectory
