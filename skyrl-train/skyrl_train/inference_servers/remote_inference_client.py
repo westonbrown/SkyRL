@@ -445,7 +445,13 @@ class RemoteInferenceClient:
             url = f"{server_url}{endpoint}"
             async with session.request(method, url, json=json) as resp:
                 resp.raise_for_status()
-                body = await resp.json() if resp.content_length else None
+                body = None
+                if resp.content_length:
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        body_text = await resp.text()
+                        body = {"text": body_text} if body_text else None
                 return server_url, {"status": resp.status, "body": body}
 
         results = await asyncio.gather(*[call_server(url) for url in self.server_urls])
@@ -569,6 +575,17 @@ class RemoteInferenceClient:
         Returns:
             Dict mapping server_url to response.
         """
+        # LoRA file-based sync uses adapter paths, not tensor chunks.
+        # Route those requests to vLLM's dynamic LoRA endpoint.
+        if hasattr(request, "lora_path"):
+            return await self._call_all_servers(
+                "/v1/load_lora_adapter",
+                {
+                    "lora_name": getattr(request, "lora_name", "skyrl-default"),
+                    "lora_path": request.lora_path,
+                    "load_inplace": True,
+                },
+            )
         return await self._call_all_servers("/update_weights", request.to_json_dict())
 
     async def finalize_weight_update(self) -> Dict[str, Any]:
