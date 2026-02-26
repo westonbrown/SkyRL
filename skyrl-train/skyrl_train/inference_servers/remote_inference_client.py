@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import numbers
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
@@ -155,6 +156,71 @@ class RemoteInferenceClient:
     # Data Plane
     # ---------------------------
 
+    @staticmethod
+    def _normalize_token_ids(token_ids: Any, field_name: str) -> List[int]:
+        """Normalize token-id containers (BatchEncoding/dict/tensor/list) to List[int]."""
+        # Support HuggingFace BatchEncoding and dict-like values.
+        if hasattr(token_ids, "input_ids"):
+            token_ids = token_ids.input_ids
+        elif isinstance(token_ids, dict):
+            if "input_ids" not in token_ids:
+                raise TypeError(f"{field_name} dict is missing `input_ids`.")
+            token_ids = token_ids["input_ids"]
+
+        # Support tensors/arrays/tuples.
+        if hasattr(token_ids, "tolist") and not isinstance(token_ids, list):
+            token_ids = token_ids.tolist()
+        elif isinstance(token_ids, tuple):
+            token_ids = list(token_ids)
+
+        # Allow accidental single-item batched format.
+        if isinstance(token_ids, list) and len(token_ids) == 1 and isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
+
+        if not isinstance(token_ids, list):
+            raise TypeError(f"{field_name} must be a list of token ids, got {type(token_ids)!r}.")
+
+        normalized: List[int] = []
+        for i, token in enumerate(token_ids):
+            if not isinstance(token, numbers.Integral):
+                raise TypeError(
+                    f"{field_name}[{i}] must be an integer token id, got {type(token)!r} ({token!r})."
+                )
+            normalized.append(int(token))
+        return normalized
+
+    @classmethod
+    def _normalize_prompt_token_batch(cls, prompt_token_ids: Any) -> List[List[int]]:
+        """Normalize prompt_token_ids to List[List[int]] for batched generation."""
+        if hasattr(prompt_token_ids, "input_ids"):
+            prompt_token_ids = prompt_token_ids.input_ids
+        elif isinstance(prompt_token_ids, dict):
+            if "input_ids" not in prompt_token_ids:
+                raise TypeError("prompt_token_ids dict is missing `input_ids`.")
+            prompt_token_ids = prompt_token_ids["input_ids"]
+
+        if hasattr(prompt_token_ids, "tolist") and not isinstance(prompt_token_ids, list):
+            prompt_token_ids = prompt_token_ids.tolist()
+        elif isinstance(prompt_token_ids, tuple):
+            prompt_token_ids = list(prompt_token_ids)
+
+        if not isinstance(prompt_token_ids, list):
+            raise TypeError(
+                f"prompt_token_ids must be List[List[int]] or List[int], got {type(prompt_token_ids)!r}."
+            )
+
+        if len(prompt_token_ids) == 0:
+            return []
+
+        # Allow single prompt passed as List[int].
+        if all(isinstance(token, numbers.Integral) for token in prompt_token_ids):
+            return [[int(token) for token in prompt_token_ids]]
+
+        return [
+            cls._normalize_token_ids(prompt_token_ids[idx], f"prompt_token_ids[{idx}]")
+            for idx in range(len(prompt_token_ids))
+        ]
+
     async def generate(
         self,
         input_batch: InferenceEngineInput,
@@ -175,9 +241,10 @@ class RemoteInferenceClient:
             InferenceEngineOutput with responses, response_ids, and stop_reasons.
         """
 
-        prompt_token_ids = input_batch.get("prompt_token_ids")
-        if prompt_token_ids is None:
+        prompt_token_ids_raw = input_batch.get("prompt_token_ids")
+        if prompt_token_ids_raw is None:
             raise ValueError("RemoteInferenceClient only accepts `prompt_token_ids`, not `prompts`.")
+        prompt_token_ids = self._normalize_prompt_token_batch(prompt_token_ids_raw)
 
         sampling_params = input_batch.get("sampling_params") or {}
         if sampling_params.get("n", 1) > 1:
@@ -228,6 +295,7 @@ class RemoteInferenceClient:
             Dict with keys: response, stop_reason, response_ids
         """
         session = await self._get_session()
+        prompt_token_ids = self._normalize_token_ids(prompt_token_ids, "prompt_token_ids")
         url = f"{self.proxy_url}/inference/v1/generate"
 
         # Determine max_tokens key and original value
