@@ -338,7 +338,16 @@ class RemoteInferenceClient:
                 headers["X-Session-ID"] = str(session_id)
 
             async with session.post(url, json=payload, headers=headers) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        "Remote inference request failed: "
+                        f"status={resp.status}, reason={resp.reason!r}, "
+                        f"prompt_tokens={len(new_prompt_ids)}, "
+                        f"accumulated_tokens={len(accum_token_ids)}, "
+                        f"remaining_max_tokens={cur_params.get(max_key) if max_key else None}, "
+                        f"body={body[:2000]!r}"
+                    )
                 response = await resp.json()
 
             choice = response["choices"][0]
