@@ -122,9 +122,9 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             wrapped_model = HFModelWrapper(
                 model_path,
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
-                # NOTE (sumanthrh): Model initialization should always be in fp32
-                # during training
-                bf16=False,
+                # Use trainer precision for model init to avoid FSDP2 load-time
+                # VRAM spikes on large BF16 models (e.g. Qwen3.5-27B).
+                bf16=self.cfg.trainer.bf16,
                 lora_rank=self.cfg.trainer.policy.model.lora.rank,
                 lora_alpha=self.cfg.trainer.policy.model.lora.alpha,
                 lora_dropout=self.cfg.trainer.policy.model.lora.dropout,
@@ -282,9 +282,8 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
                 model_path,
                 "critic",
                 use_flash_attention_2=self.cfg.trainer.flash_attn,
-                # NOTE (sumanthrh): Model initialization should always be in fp32
-                # during training
-                bf16=False,
+                # Match trainer precision to keep init-time memory bounded.
+                bf16=self.cfg.trainer.bf16,
                 lora_rank=self.cfg.trainer.critic.model.lora.rank,
                 lora_alpha=self.cfg.trainer.critic.model.lora.alpha,
                 lora_dropout=self.cfg.trainer.critic.model.lora.dropout,
