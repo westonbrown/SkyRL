@@ -309,6 +309,18 @@ class Worker(DistributedTorchRayActor):
 
         assert inference_engine_client is not None
 
+        # OpenCTF: when LoRA is enabled and inference engines are remote,
+        # use file-based adapter sync instead of NCCL sender/receiver setup.
+        _lora_rank = getattr(self.cfg.trainer.policy.model.lora, "rank", 0)
+        _run_locally = getattr(self.cfg.generator, "run_engines_locally", True)
+        if _lora_rank > 0 and not _run_locally:
+            logger.warning(
+                "Skipping NCCL weight sync init (LoRA rank={}, remote engines). Using file-based sync.",
+                _lora_rank,
+            )
+            self._weight_transfer_sender = None
+            return
+
         # For new inference path, fetch world_size from servers
         # For legacy path, calculate from config
         inference_world_size = None
@@ -801,6 +813,29 @@ class PolicyWorkerBase(Worker):
                 compute_entropy=True,
                 entropy_requires_grad=self.cfg.trainer.algorithm.use_entropy_loss,
             )
+            # loss_mask / advantages diagnostics
+            import logging as _diag_logging
+            _diag_logger = _diag_logging.getLogger("skyrl_train.workers.loss_diag")
+            _lm_sum = loss_mask.sum().item() if loss_mask is not None else "None"
+            _lm_shape = tuple(loss_mask.shape) if loss_mask is not None else "None"
+            _lm_any = bool(loss_mask.any().item()) if loss_mask is not None else "None"
+            _am_sum = action_mask.sum().item() if action_mask is not None else "None"
+            _adv_sum = advantages.sum().item() if advantages is not None else "None"
+            _adv_abs_max = advantages.abs().max().item() if advantages is not None else "None"
+            _diag_logger.warning(
+                "LOSS_DIAG: loss_mask sum=%s shape=%s any_nonzero=%s action_mask_sum=%s | "
+                "advantages sum=%s abs_max=%s | num_actions=%s",
+                _lm_sum, _lm_shape, _lm_any, _am_sum, _adv_sum, _adv_abs_max, num_actions,
+            )
+            # Fall back to action_mask when loss_mask is all zeros to prevent zero gradient.
+            if loss_mask is not None and not loss_mask.any():
+                if action_mask is not None and action_mask.any():
+                    _diag_logger.warning(
+                        "LOSS_DIAG_FIX: loss_mask all-zero, falling back to action_mask (sum=%s).",
+                        _am_sum,
+                    )
+                    loss_mask = action_mask.float()
+
             # loss function
             # TODO: recompute advantages
             policy_loss, loss_metrics = current_loss_fn(
