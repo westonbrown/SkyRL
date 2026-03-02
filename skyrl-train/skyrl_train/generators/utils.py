@@ -74,6 +74,9 @@ CUSTOM_CHAT_TEMPLATES = {
         "{{'\n'}}"
         "{% endif %}"
         "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{'<|im_start|>assistant\n'}}"
+        "{% endif %}"
     ),
     # chat template for qwen3 that strips non-last-turn thinking tokens (same as the official Qwen3 chat
     # template but we add `generation` and `endgeneration` tags)
@@ -95,6 +98,9 @@ CUSTOM_CHAT_TEMPLATES = {
         "{{'\n'}}"
         "{% endif %}"
         "{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{'<|im_start|>assistant\n'}}"
+        "{% endif %}"
     ),
 }
 
