@@ -312,6 +312,12 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     # we set `assign=True` because our params can be on meta device
     model.load_state_dict(sharded_sd, assign=True)
 
+    # Free state dict GPU tensors before offload/reload cycle.
+    # Without this, sharded_sd holds refs to GPU tensors preventing memory reclaim.
+    del sharded_sd
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+
     # If we don't offload FSDP2 Module to CPU and then back to GPU,
     # it will occupy a large amount of reserved GPU memory，which can not be released using torch.cuda.empty_cache()
     # even if we are using cpu_offload
@@ -541,7 +547,16 @@ def collect_lora_params(module: FSDP) -> OrderedDict:
     """
     lora_params = OrderedDict()
     peft_model = getattr(module, "_fsdp_wrapped_module", module)
-    if fsdp_version(module) > 0:
+    _fv = fsdp_version(module)
+    if _fv == 2:
+        # FSDP2: no summon_full_params (FSDP1-only API). Access params directly.
+        lora_params = get_peft_model_state_dict(peft_model)
+        lora_params = {
+            name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
+            for name, param in lora_params.items()
+        }
+        torch.cuda.empty_cache()
+    elif _fv == 1:
         with FSDP.summon_full_params(module, writeback=False):
             # If base model is synced, we can get the full state dict from peft model
             lora_params = get_peft_model_state_dict(peft_model)
