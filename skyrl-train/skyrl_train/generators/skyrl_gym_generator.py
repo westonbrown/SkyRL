@@ -99,6 +99,77 @@ class TurnOutput:
         return self.output_logprobs + [0.0] * len(self.obs_ids)
 
 
+
+# Convert OmegaConf containers in chat_template_kwargs to plain Python types.
+# transformers.apply_chat_template() validates tools with isinstance(tool, dict)
+# which fails for OmegaConf DictConfig.
+def _resolve_chat_template_kwargs(kwargs):
+    try:
+        from omegaconf import OmegaConf, DictConfig, ListConfig
+        if any(isinstance(v, (DictConfig, ListConfig)) for v in kwargs.values()):
+            return OmegaConf.to_container(OmegaConf.create(kwargs), resolve=True)
+    except ImportError:
+        pass
+    return dict(kwargs)
+
+
+# Inject tools into system message for custom templates that lack {% if tools %} support.
+def _inject_tools_into_system_message(chat_history, chat_template_kwargs, custom_chat_template):
+    if not custom_chat_template:
+        return chat_history, chat_template_kwargs
+    tools = chat_template_kwargs.get("tools")
+    if not tools:
+        return chat_history, chat_template_kwargs
+    # Check if the custom template handles tools natively
+    if "tools" in custom_chat_template:
+        return chat_history, chat_template_kwargs
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.warning(
+        "Custom chat template does not handle tools= kwarg — injecting %d "
+        "tool schemas as text into the system message.",
+        len(tools),
+    )
+    # Build a compact text representation of tool schemas
+    tool_lines = []
+    for tool_def in tools:
+        fn = tool_def.get("function", tool_def) if isinstance(tool_def, dict) else {}
+        name = fn.get("name", "unknown")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {})
+        props = params.get("properties", {})
+        required = params.get("required", [])
+        param_parts = []
+        for pname, pschema in props.items():
+            ptype = pschema.get("type", "string")
+            req = " [required]" if pname in required else ""
+            param_parts.append(f"  - {pname}: {ptype}{req}")
+        param_str = "\n".join(param_parts) if param_parts else "  (no parameters)"
+        tool_lines.append(f"- {name}: {desc}\n{param_str}")
+    tools_block = (
+        "\n\n# Available Tools\n\n"
+        "Call tools using: <tool_call><function=tool_name>"
+        "<parameter=param>value</parameter>"
+        "</function></tool_call>\n\n"
+        + "\n".join(tool_lines)
+        + "\n"
+    )
+    import copy as _copy
+    chat_history = _copy.deepcopy(chat_history)
+    if chat_history and chat_history[0].get("role") == "system":
+        sys_content = chat_history[0].get("content", "")
+        if "# Available Tools" not in sys_content and "<tools>" not in sys_content:
+            chat_history[0] = {**chat_history[0], "content": sys_content + tools_block}
+    else:
+        chat_history.insert(0, {
+            "role": "system",
+            "content": "You are a helpful assistant." + tools_block,
+        })
+    chat_template_kwargs = dict(chat_template_kwargs)
+    del chat_template_kwargs["tools"]
+    return chat_history, chat_template_kwargs
+
+
 class SkyRLGymGenerator(GeneratorInterface):
     def __init__(
         self,
@@ -145,7 +216,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             self.base_conversation,
             add_generation_prompt=False,
             tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
+            **_resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
         )
         # We remove tokens after the last EOS token so that it can be captured in `observation_ids`.
         # For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator#multi-turn-tokenization-and-ti-to
@@ -232,6 +303,12 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         # init() returns the first prompt to be given to the model, and optional metadata dict
         chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+        # Inject tools into system message if custom template can't handle them
+        chat_history, _patched_kwargs = _inject_tools_into_system_message(
+            chat_history,
+            _resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
+            self.custom_chat_template,
+        )
         initial_chat_history_length = len(chat_history)
         initial_input_ids = self.tokenizer.apply_chat_template(
             chat_history,
@@ -240,7 +317,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             add_generation_prompt=not retokenize_chat_history,
             chat_template=self.custom_chat_template if retokenize_chat_history else None,
             tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
+            **_resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
         )
 
         initial_prompt_length = len(initial_input_ids)
@@ -290,7 +367,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     chat_template=self.custom_chat_template if retokenize_chat_history else None,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **self.generator_cfg.chat_template_kwargs,
+                    **_resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
                 )
                 agent_loop_state.loss_mask = []
                 agent_loop_state.rollout_logprobs = None
@@ -414,7 +491,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 return_dict=True,
                 return_assistant_tokens_mask=True,
                 tokenize=True,
-                **self.generator_cfg.chat_template_kwargs,
+                **_resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
             )
             loss_mask = response_encodings["assistant_masks"]
             response_ids = response_encodings["input_ids"]
@@ -449,7 +526,34 @@ class SkyRLGymGenerator(GeneratorInterface):
         if self.generator_cfg.step_wise_trajectories:
             for per_step_output, (reward, resp_end_idx) in zip(agent_loop_output.step_outputs, per_step_rewards):
                 per_token_reward = [0.0] * len(per_step_output.response_ids)
-                per_token_reward[resp_end_idx] = float(reward)
+                # Guard step-wise per_token_reward index (fallback, never skip)
+                if 0 <= resp_end_idx < len(per_token_reward):
+                    per_token_reward[resp_end_idx] = float(reward)
+                elif per_token_reward:
+                    # Fallback: write reward at last valid position when model
+                    # generates empty/special-token-only output (resp_end_idx=-1)
+                    # or overshoots the list bounds.
+                    fallback_idx = len(per_token_reward) - 1
+                    per_token_reward[fallback_idx] = float(reward)
+                    logger.warning(
+                        "Fallback step-wise reward write: resp_end_idx=%s -> fallback_idx=%s "
+                        "len(per_token_reward)=%s reward=%s",
+                        resp_end_idx,
+                        fallback_idx,
+                        len(per_token_reward),
+                        reward,
+                    )
+                else:
+                    logger.warning(
+                        "Skipping step-wise reward write: per_token_reward empty, "
+                        "resp_end_idx=%s reward=%s",
+                        resp_end_idx,
+                        reward,
+                    )
+                # Ensure per_token_reward is never empty (prevents ValueError
+                # in postprocess_generator_output when model generates no tokens for a step).
+                if not per_token_reward:
+                    per_token_reward = [0.0]
                 # in-place update to per-token reward
                 per_step_output.reward = per_token_reward
         else:
@@ -527,7 +631,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     [*self.base_conversation, *new_obs],
                     add_generation_prompt=not is_done,
                     tokenize=True,
-                    **self.generator_cfg.chat_template_kwargs,
+                    **_resolve_chat_template_kwargs(self.generator_cfg.chat_template_kwargs),
                 )[len(self.base_conversation_token_ids) :]
             elif not is_done:
                 obs_ids_to_add = self.generation_prompt_ids
