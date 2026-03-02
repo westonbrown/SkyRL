@@ -14,7 +14,22 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BitsAndByt
 import numpy as np
 from skyrl_train.distributed.ulysses.utils import ulysses_pad_and_slice_inputs, gather_outputs_and_unpad
 from skyrl_train.utils.torch_utils import chunked_entropy_from_logits, logprobs_from_logits
-from flash_attn.bert_padding import pad_input, unpad_input
+# flash-attn is optional when sample packing is disabled.
+# SkyRL previously imported it unconditionally, which breaks environments
+# that run with flash_attn=False but do not have the flash-attn Python module.
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input
+except Exception as exc:
+    _FLASH_ATTN_IMPORT_ERROR = exc
+
+    def _require_flash_attn(*_args, **_kwargs):
+        raise RuntimeError(
+            "flash_attn is required for sample packing paths in skyrl-train. "
+            "Set use_sample_packing=False (or install a compatible flash-attn build)."
+        ) from _FLASH_ATTN_IMPORT_ERROR
+
+    pad_input = _require_flash_attn
+    unpad_input = _require_flash_attn
 from packaging.version import Version
 
 
