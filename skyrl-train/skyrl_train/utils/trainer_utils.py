@@ -524,7 +524,11 @@ def handle_filter_sampling(
         final_output = collected_state["collected_generator_output"]
         final_uids = collected_state["collected_uids"]
 
-        if len(final_uids) > max_trajectories:
+        # With step_wise_trajectories, entries are steps within trajectories
+        # (not separate trajectories). Truncating by entry count would split
+        # trajectories and lose is_last_step=True entries at the end.
+        _is_step_wise = bool(final_output.get("is_last_step"))
+        if not _is_step_wise and len(final_uids) > max_trajectories:
             final_output = filter_generator_output(final_output, list(range(max_trajectories)))
             final_uids = final_uids[:max_trajectories]
 
@@ -561,6 +565,12 @@ def filter_generator_output(output: GeneratorOutput, kept_indices: List[int]) ->
 
     if output.get("stop_reasons"):
         filtered["stop_reasons"] = [output["stop_reasons"][i] for i in kept_indices]
+
+    # Propagate step-wise trajectory keys (needed when step_wise_trajectories=true)
+    if output.get("is_last_step") is not None:
+        filtered["is_last_step"] = [output["is_last_step"][i] for i in kept_indices]
+    if output.get("trajectory_ids") is not None:
+        filtered["trajectory_ids"] = [output["trajectory_ids"][i] for i in kept_indices]
 
     return filtered
 
